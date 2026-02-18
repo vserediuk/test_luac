@@ -393,10 +393,11 @@ def validate_loop_range(instructions, start, end):
     """
     Validate that a proposed LOOP range [start, end) is safe to insert.
     
-    Checks that all jumps within the range either:
-    - Stay within the range (internal if/else)
-    - Jump to the end position (break)
-    - Jump backward to the start (repeat...until pattern)
+    CONSERVATIVE checks:
+    1. All jumps within range must stay within [start, end] or jump to exactly end (break)
+    2. Must have exactly one backward jump that returns to start (the repeat...until condition)
+    3. No forward jumps that exit beyond end
+    4. The backward jump should be near the end of the range (last few instructions)
     
     Returns True if the LOOP range is valid, False otherwise.
     """
@@ -405,6 +406,10 @@ def validate_loop_range(instructions, start, end):
     # Bounds check
     if start < 0 or end > n or start >= end:
         return False
+    
+    # Track backward jumps to start
+    backward_jumps_to_start = 0
+    last_backward_jump_pos = -1
     
     # Check all jumps within the proposed loop range
     for i in range(start, end):
@@ -417,27 +422,48 @@ def validate_loop_range(instructions, start, end):
                 if jmp_pos < end:  # JMP is within the proposed range
                     jmp_target = jmp_pos + 1 + bc_j(instructions[jmp_pos])
                     
-                    # Check if jump is valid:
-                    # - Forward jump within or to end: OK
-                    # - Backward jump to start or within range: OK  
-                    # - Any other jump: INVALID
+                    # CONSERVATIVE: All jumps must stay within [start, end]
                     if jmp_target < start:
                         # Backward jump exits the loop range - INVALID
                         return False
-                    # Forward jumps within [start, end] or to end position are OK
-                    # jmp_target >= start is guaranteed if we're here
+                    elif jmp_target > end:
+                        # Forward jump exits beyond end - INVALID for conservative mode
+                        return False
+                    
+                    # Track backward jumps to start
+                    if jmp_target == start:
+                        backward_jumps_to_start += 1
+                        last_backward_jump_pos = jmp_pos
         
         # Check standalone JMP
         elif op == OP['JMP']:
             jmp_target = i + 1 + bc_j(instructions[i])
             
-            # Backward jump
-            if jmp_target < i:
-                if jmp_target < start:
-                    # Backward jump exits the loop range - INVALID
-                    return False
-                # Backward jump within range or to start is OK
-            # Forward jumps are OK (either within range or breaking out)
+            # CONSERVATIVE: Check all jumps stay within [start, end]
+            if jmp_target < start:
+                # Backward jump exits the loop range - INVALID
+                return False
+            elif jmp_target > end:
+                # Forward jump exits beyond end - INVALID for conservative mode
+                return False
+            
+            # Track backward jumps to start
+            if jmp_target == start:
+                backward_jumps_to_start += 1
+                last_backward_jump_pos = i
+    
+    # CONSERVATIVE: Require exactly one backward jump to start
+    # This is the characteristic of a proper repeat...until loop
+    if backward_jumps_to_start != 1:
+        return False
+    
+    # CONSERVATIVE: The backward jump should be near the end (last 20% of range)
+    range_size = end - start
+    if last_backward_jump_pos != -1:
+        distance_from_end = end - last_backward_jump_pos
+        if distance_from_end > max(5, range_size // 5):
+            # Backward jump is too far from the end - probably not a proper loop
+            return False
     
     return True
 
@@ -451,7 +477,11 @@ def insert_missing_loops(instructions):
     at the beginning of the loop body. Obfuscation can remove these.
     The decompiler needs them to properly build loop/if structures.
     
-    This version validates that proposed LOOP ranges are safe before insertion.
+    CONSERVATIVE VERSION: Only inserts LOOPs when we're CERTAIN the structure is valid:
+    - Exactly one backward edge to the start (the repeat...until condition)
+    - All internal jumps stay within [start, end] or go to exactly end
+    - No forward jumps that exit beyond end
+    - The backward jump is near the end (proper loop structure)
 
     Returns new instruction list with LOOPs inserted and jumps fixed.
     """
@@ -626,15 +656,12 @@ def fix_cross_loop_backward_jumps(instructions):
     
     Strategy:
     - Backward jumps within the same LOOP (repeat...until) - leave alone
-    - Backward jumps crossing LOOP boundaries - remove the jump (convert to NOP)
-      rather than redirecting, as redirecting creates invalid control flow
+    - Backward jumps crossing LOOP boundaries:
+      * For condition+JMP pairs: Replace comparison with MOV A,A (NOP) and JMP with JMP+0
+      * For standalone JMP: Replace with JMP+0
     - Cases with no enclosing LOOP - leave for validation pass
     
-    Handles:
-    1. Backward jumps within the same LOOP (legitimate repeat...until) - leave alone
-    2. Backward jumps crossing LOOP boundaries - convert to NOP (fallthrough)
-    3. Nested LOOPs - find innermost enclosing LOOP
-    4. Cases with no enclosing LOOP - leave for validation pass
+    This prevents orphaned CONDITION statements that cause "Failed to build if statement"
     """
     n = len(instructions)
 
@@ -680,8 +707,10 @@ def fix_cross_loop_backward_jumps(instructions):
                             continue
                         else:
                             # Backward jump crosses LOOP boundary
-                            # Convert to NOP (jump to next instruction)
-                            # This is safer than redirecting to loop end which may not have a valid label
+                            # Replace comparison with MOV A,A (NOP) to avoid orphaned CONDITION
+                            a_reg = bc_a(instructions[i])
+                            result[i] = make_ins_ad(OP['MOV'], a_reg, a_reg)
+                            # Convert JMP to JMP+0 (fallthrough)
                             new_d = BCBIAS_J  # Jump offset 0 = next instruction
                             result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
                             changed = True
@@ -703,7 +732,7 @@ def fix_cross_loop_backward_jumps(instructions):
                         continue
                     else:
                         # Backward jump crosses LOOP boundary
-                        # Convert to NOP (jump to next instruction)
+                        # Convert to JMP+0 (fallthrough)
                         new_d = BCBIAS_J  # Jump offset 0 = next instruction
                         result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
                         changed = True
@@ -788,8 +817,9 @@ def validate_and_cleanup_control_flow(instructions):
     
     1. Validates all LOOP ranges have forward targets and proper bounds
     2. Ensures no backward jumps exist without an enclosing LOOP
-    3. Removes remaining problematic backward JMPs by converting to NOPs
-    4. Validates LOOP ranges don't overlap invalidly
+    3. For condition+JMP pairs with problematic backward jumps: Replace comparison with MOV A,A and JMP with JMP+0
+    4. For standalone problematic backward JMPs: Replace with JMP+0
+    5. Validates LOOP ranges don't overlap invalidly
     
     This is the final pass to ensure the bytecode can be decompiled successfully.
     """
@@ -847,14 +877,14 @@ def validate_and_cleanup_control_flow(instructions):
                 if enclosing is None:
                     # Backward jump with NO enclosing LOOP
                     # This cannot be expressed in Lua 5.1 without goto
-                    # Convert to a NOP (jump to next instruction)
+                    # Convert to JMP+0 (fallthrough)
                     new_d = BCBIAS_J
                     result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
                 else:
                     ls, le = enclosing
                     if jmp_target < ls:
                         # Backward jump crosses LOOP boundary
-                        # Convert to NOP (fallthrough)
+                        # Convert to JMP+0 (fallthrough)
                         new_d = BCBIAS_J
                         result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
                     else:
@@ -869,7 +899,9 @@ def validate_and_cleanup_control_flow(instructions):
                 
                 # Validate target is in bounds [0, n] (n is valid - represents end of function)
                 if jmp_target < 0 or jmp_target > n:
-                    # Invalid target - convert to NOP
+                    # Invalid target - replace comparison with MOV A,A and JMP with JMP+0
+                    a_reg = bc_a(instructions[i])
+                    result[i] = make_ins_ad(OP['MOV'], a_reg, a_reg)
                     new_d = BCBIAS_J
                     result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
                 elif jmp_target < i:
@@ -878,14 +910,18 @@ def validate_and_cleanup_control_flow(instructions):
                     
                     if enclosing is None:
                         # Backward jump with NO enclosing LOOP
-                        # Convert to forward jump (NOP equivalent)
+                        # Replace comparison with MOV A,A and JMP with JMP+0
+                        a_reg = bc_a(instructions[i])
+                        result[i] = make_ins_ad(OP['MOV'], a_reg, a_reg)
                         new_d = BCBIAS_J
                         result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
                     else:
                         ls, le = enclosing
                         if jmp_target < ls:
                             # Backward jump crosses LOOP boundary
-                            # Convert to NOP (fallthrough)
+                            # Replace comparison with MOV A,A and JMP with JMP+0
+                            a_reg = bc_a(instructions[i])
+                            result[i] = make_ins_ad(OP['MOV'], a_reg, a_reg)
                             new_d = BCBIAS_J
                             result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
                         else:
@@ -1773,38 +1809,37 @@ def clean_prototype(proto, proto_idx):
     # Step 9: Fix empty infinite loops (LOOP + JMP backward with no body)
     proto.instructions = fix_empty_infinite_loops(proto.instructions)
     
-    # Step 10: Simplify ISTC/ISFC to IST/ISF
-    proto.instructions = simplify_test_copy_ops(proto.instructions)
+    # Step 10: DO NOT simplify ISTC/ISFC to IST/ISF
+    # The decompiler handles ISTC/ISFC correctly and converting loses copy semantics
+    # proto.instructions = simplify_test_copy_ops(proto.instructions)
     
     # Step 11: Insert missing LOOP instructions for backward jumps
+    # CONSERVATIVE: Only insert when safe - no cross-boundary jumps
     proto.instructions = insert_missing_loops(proto.instructions)
     
     # Step 12: Fix backward-jumping conditions inside LOOPs
-    # Convert them to forward jumps to the enclosing LOOP's end
+    # Convert them to MOV+JMP+0 pattern to avoid orphaned conditions
     proto.instructions = fix_cross_loop_backward_jumps(proto.instructions)
     
     # Step 13: Validate and cleanup control flow
     # Final pass to ensure all patterns can be decompiled
     proto.instructions = validate_and_cleanup_control_flow(proto.instructions)
     
-    # Step 14: Fix forward jumps that land in condition+JMP pairs
-    # These confuse the decompiler's if-statement builder
-    proto.instructions = fix_forward_jumps_to_conditions(proto.instructions)
+    # Step 14: REMOVED - fix_forward_jumps_to_conditions
+    # This breaks the condition chain structure that the decompiler expects
+    # proto.instructions = fix_forward_jumps_to_conditions(proto.instructions)
     
-    # ========== AGGRESSIVE TRANSFORMATIONS ==========
-    # These are radical rewrites that prioritize decompilability over preserving original structure
+    # ========== AGGRESSIVE TRANSFORMATIONS REMOVED ==========
+    # These break the decompiler's expected control flow patterns:
+    # - aggressive_simplify_control_flow: Breaks jump chains
+    # - aggressive_remove_empty_loops: Removes LOOPs the decompiler needs
+    # - aggressive_flatten_conditions: Breaks condition chain structure
+    # - aggressive_normalize_patterns: Unnecessary pattern changes
     
-    # Step 15: AGGRESSIVE - Simplify complex control flow
-    proto.instructions = aggressive_simplify_control_flow(proto.instructions)
-    
-    # Step 16: AGGRESSIVE - Remove empty/suspicious LOOPs
-    proto.instructions = aggressive_remove_empty_loops(proto.instructions)
-    
-    # Step 17: AGGRESSIVE - Flatten complex conditions
-    proto.instructions = aggressive_flatten_conditions(proto.instructions)
-    
-    # Step 18: AGGRESSIVE - Normalize all patterns
-    proto.instructions = aggressive_normalize_patterns(proto.instructions)
+    # Step 15: Final dead code removal after all transformations
+    final_reachable = analyze_reachability(proto.instructions)
+    if len(final_reachable) < len(proto.instructions):
+        proto.instructions = remove_dead_code(proto.instructions, final_reachable)
     
     # Step 19: Recalculate framesize
     # The obfuscator may have set an incorrect framesize that is too small
