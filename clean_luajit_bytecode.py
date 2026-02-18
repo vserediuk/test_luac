@@ -320,7 +320,6 @@ def remove_dead_code(instructions, reachable):
     for new_idx in range(len(new_instructions)):
         ins = new_instructions[new_idx]
         op = bc_op(ins)
-        opname = get_opname(op) if op < BC_MAX else "UNKNOWN"
         
         needs_jump_fix = False
         
