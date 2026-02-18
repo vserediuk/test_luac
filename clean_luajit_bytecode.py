@@ -810,27 +810,16 @@ def validate_and_cleanup_control_flow(instructions):
                 end = n
             elif end <= i:
                 # LOOP with backward or zero-length target - invalid
+                # Note: This overlaps with the bounds check in validate_loop_range()
+                # but provides an additional safety net during validation
                 invalid_loops.add(i)
                 end = i + 1
             
             if i not in invalid_loops:
                 loop_ranges.append((i, end))
     
-    # Validate LOOP nesting (optional, for debugging)
-    # Check for overlapping LOOPs that aren't properly nested
-    for i, (start1, end1) in enumerate(loop_ranges):
-        for j, (start2, end2) in enumerate(loop_ranges):
-            if i != j:
-                # Check for invalid overlap
-                # Valid: start2 in [start1, end1) AND end2 <= end1 (nested)
-                # Valid: start2 >= end1 OR end2 <= start1 (disjoint)
-                # Invalid: partial overlap
-                if start2 < end1 and start1 < end2:
-                    # Overlapping - check if properly nested
-                    if not (start1 <= start2 and end2 <= end1) and not (start2 <= start1 and end1 <= end2):
-                        # Improper nesting - both loops are potentially problematic
-                        # For safety, we'll just log this (could remove both)
-                        pass
+    # Note: LOOP nesting validation could be added here, but overlapping LOOPs
+    # are rare in practice after our earlier filtering and validation steps
     
     result = list(instructions)
     
@@ -846,7 +835,7 @@ def validate_and_cleanup_control_flow(instructions):
         
         if op == OP['JMP']:
             jmp_target = i + 1 + bc_j(instructions[i])
-            # Validate target is in bounds
+            # Validate target is in bounds [0, n] (n is valid - represents end of function)
             if jmp_target < 0 or jmp_target > n:
                 # Invalid target - convert to NOP
                 new_d = BCBIAS_J
@@ -868,7 +857,9 @@ def validate_and_cleanup_control_flow(instructions):
                         # Convert to NOP (fallthrough)
                         new_d = BCBIAS_J
                         result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
-                    # else: backward jump within same LOOP - this is OK (repeat...until)
+                    else:
+                        # Backward jump within same LOOP - this is OK (repeat...until)
+                        pass
         
         elif op in COMPARISON_OPS or op in UNARY_TEST_OPS:
             # Check if followed by a JMP
@@ -876,7 +867,7 @@ def validate_and_cleanup_control_flow(instructions):
                 jmp_pos = i + 1
                 jmp_target = jmp_pos + 1 + bc_j(instructions[jmp_pos])
                 
-                # Validate target is in bounds
+                # Validate target is in bounds [0, n] (n is valid - represents end of function)
                 if jmp_target < 0 or jmp_target > n:
                     # Invalid target - convert to NOP
                     new_d = BCBIAS_J
@@ -897,7 +888,9 @@ def validate_and_cleanup_control_flow(instructions):
                             # Convert to NOP (fallthrough)
                             new_d = BCBIAS_J
                             result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
-                        # else: backward jump within same LOOP - this is OK (repeat...until)
+                        else:
+                            # Backward jump within same LOOP - this is OK (repeat...until)
+                            pass
     
     return result
 
