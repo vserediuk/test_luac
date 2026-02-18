@@ -790,6 +790,56 @@ def validate_and_cleanup_control_flow(instructions):
     return result
 
 
+def fix_forward_jumps_to_conditions(instructions):
+    """
+    Fix forward jumps that land in the middle of condition+JMP pairs.
+    
+    When a forward jump targets a condition instruction (ISLT, ISGE, etc.) 
+    that's immediately followed by a JMP, it creates ambiguous control flow
+    that confuses the decompiler. The decompiler expects conditions to be
+    entered from the previous instruction, not jumped to directly.
+    
+    Solution: Insert a NOP (JMP +0) before such condition instructions if 
+    they are jump targets, or redirect the jumps to skip the condition entirely.
+    
+    For now, we redirect jumps to skip past the condition+JMP pair entirely.
+    """
+    n = len(instructions)
+    if n == 0:
+        return instructions
+    
+    # Find all condition+JMP pairs
+    condition_pairs = set()
+    for i in range(n - 1):
+        op = bc_op(instructions[i])
+        next_op = bc_op(instructions[i + 1])
+        if (op in COMPARISON_OPS or op in UNARY_TEST_OPS) and next_op == OP['JMP']:
+            condition_pairs.add(i)
+    
+    if not condition_pairs:
+        return instructions
+    
+    # Find all forward jumps that target condition pairs
+    result = list(instructions)
+    changed = False
+    
+    for i in range(n):
+        op = bc_op(instructions[i])
+        
+        if op == OP['JMP']:
+            target = i + 1 + bc_j(instructions[i])
+            if target > i and target in condition_pairs:
+                # Forward jump lands on a condition - redirect to skip the condition+JMP pair
+                new_target = target + 2  # Skip condition and its JMP
+                if new_target <= n:
+                    new_jump = new_target - (i + 1)
+                    new_d = new_jump + BCBIAS_J
+                    result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
+                    changed = True
+    
+    return result
+
+
 def remove_nop_patterns(instructions):
     """
     Remove NOP-like instruction patterns that serve as padding/obfuscation:
@@ -1242,6 +1292,10 @@ def clean_prototype(proto, proto_idx):
     # Step 13: Validate and cleanup control flow
     # Final pass to ensure all patterns can be decompiled
     proto.instructions = validate_and_cleanup_control_flow(proto.instructions)
+    
+    # Step 14: Fix forward jumps that land in condition+JMP pairs
+    # These confuse the decompiler's if-statement builder
+    proto.instructions = fix_forward_jumps_to_conditions(proto.instructions)
     
     proto.sizebc_minus1 = len(proto.instructions)
     
