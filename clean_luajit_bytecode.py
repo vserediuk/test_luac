@@ -529,7 +529,7 @@ def insert_missing_loops(instructions):
     return result
 
 
-def _find_innermost_enclosing_loop(loop_ranges, pos):
+def find_innermost_enclosing_loop(loop_ranges, pos):
     """
     Find the innermost LOOP that contains position pos.
     
@@ -597,7 +597,7 @@ def fix_cross_loop_backward_jumps(instructions):
                 jmp_target = jmp_pos + 1 + bc_j(instructions[jmp_pos])
                 if jmp_target < i:
                     # Find innermost enclosing LOOP
-                    enclosing = _find_innermost_enclosing_loop(loop_ranges, i)
+                    enclosing = find_innermost_enclosing_loop(loop_ranges, i)
                     
                     if enclosing is not None:
                         ls, le = enclosing
@@ -619,7 +619,7 @@ def fix_cross_loop_backward_jumps(instructions):
             jmp_target = i + 1 + bc_j(instructions[i])
             if jmp_target < i:
                 # Find innermost enclosing LOOP
-                enclosing = _find_innermost_enclosing_loop(loop_ranges, i)
+                enclosing = find_innermost_enclosing_loop(loop_ranges, i)
                 
                 if enclosing is not None:
                     ls, le = enclosing
@@ -745,13 +745,13 @@ def validate_and_cleanup_control_flow(instructions):
             jmp_target = i + 1 + bc_j(instructions[i])
             if jmp_target < i:
                 # Backward jump
-                enclosing = _find_innermost_enclosing_loop(loop_ranges, i)
+                enclosing = find_innermost_enclosing_loop(loop_ranges, i)
                 
                 if enclosing is None:
                     # Backward jump with NO enclosing LOOP
                     # This cannot be expressed in Lua 5.1 without goto
                     # Convert to a NOP (jump to next instruction)
-                    new_d = 0 + BCBIAS_J
+                    new_d = BCBIAS_J
                     result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
                 else:
                     ls, le = enclosing
@@ -771,12 +771,12 @@ def validate_and_cleanup_control_flow(instructions):
                 jmp_target = jmp_pos + 1 + bc_j(instructions[jmp_pos])
                 if jmp_target < i:
                     # Backward jump from condition
-                    enclosing = _find_innermost_enclosing_loop(loop_ranges, i)
+                    enclosing = find_innermost_enclosing_loop(loop_ranges, i)
                     
                     if enclosing is None:
                         # Backward jump with NO enclosing LOOP
                         # Convert to forward jump (NOP equivalent)
-                        new_d = 0 + BCBIAS_J
+                        new_d = BCBIAS_J
                         result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
                     else:
                         ls, le = enclosing
