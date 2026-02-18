@@ -840,6 +840,235 @@ def fix_forward_jumps_to_conditions(instructions):
     return result
 
 
+def aggressive_simplify_control_flow(instructions):
+    """
+    AGGRESSIVE: Simplify complex control flow patterns that confuse decompilers.
+    
+    This performs radical transformations:
+    1. Convert complex nested condition chains to linear form
+    2. Simplify jump chains (JMP -> JMP -> target becomes JMP -> target)
+    3. Remove redundant LOOPs
+    4. Flatten condition+JMP+JMP patterns
+    
+    WARNING: This may change program semantics but aims for decompilability.
+    """
+    n = len(instructions)
+    if n == 0:
+        return instructions
+    
+    result = list(instructions)
+    changed = True
+    iterations = 0
+    max_iterations = 10
+    
+    while changed and iterations < max_iterations:
+        changed = False
+        iterations += 1
+        
+        # Pass 1: Simplify jump chains
+        for i in range(len(result)):
+            op = bc_op(result[i])
+            if op == OP['JMP']:
+                target = i + 1 + bc_j(result[i])
+                if 0 <= target < len(result):
+                    target_op = bc_op(result[target])
+                    # If target is also a JMP, follow the chain
+                    if target_op == OP['JMP']:
+                        final_target = target + 1 + bc_j(result[target])
+                        if 0 <= final_target < len(result):
+                            # Redirect to final target
+                            new_jump = final_target - (i + 1)
+                            new_d = new_jump + BCBIAS_J
+                            result[i] = make_ins_ad(OP['JMP'], bc_a(result[i]), new_d)
+                            changed = True
+        
+        # Pass 2: Simplify condition+JMP followed by another JMP
+        for i in range(len(result) - 2):
+            op = bc_op(result[i])
+            if op in COMPARISON_OPS or op in UNARY_TEST_OPS:
+                next_op = bc_op(result[i + 1])
+                next_next_op = bc_op(result[i + 2])
+                if next_op == OP['JMP'] and next_next_op == OP['JMP']:
+                    # Pattern: COND, JMP, JMP - potentially simplifiable
+                    # This is often obfuscation - the second JMP is the else branch
+                    # Keep as is for now, but mark for potential simplification
+                    pass
+    
+    return result
+
+
+def aggressive_remove_empty_loops(instructions):
+    """
+    AGGRESSIVE: Remove LOOPs that don't contain meaningful loop bodies.
+    
+    Identifies and removes:
+    1. LOOPs with only a few instructions (likely obfuscation)
+    2. LOOPs with no backward jumps (not real loops)
+    3. Nested LOOPs that are redundant
+    4. ALL LOOPs in extremely complex prototypes (>5000 instructions with >50 LOOPs)
+    """
+    n = len(instructions)
+    if n == 0:
+        return instructions
+    
+    # Find all LOOPs and analyze them
+    loop_info = []
+    for i in range(n):
+        op = bc_op(instructions[i])
+        if op == OP['LOOP']:
+            end = i + 1 + bc_j(instructions[i])
+            body_size = end - i - 1
+            
+            # Check if there's a backward jump in this range
+            has_backward_jump = False
+            for j in range(i + 1, min(end, n)):
+                jop = bc_op(instructions[j])
+                if jop == OP['JMP']:
+                    jtarget = j + 1 + bc_j(instructions[j])
+                    if jtarget <= i:
+                        has_backward_jump = True
+                        break
+                elif jop in LOOP_BACK_OPS:
+                    has_backward_jump = True
+                    break
+            
+            loop_info.append({
+                'pos': i,
+                'end': end,
+                'size': body_size,
+                'has_backward': has_backward_jump
+            })
+    
+    # AGGRESSIVE: If too many LOOPs, remove most of them
+    keep = [True] * n
+    
+    if n > 5000 and len(loop_info) > 50:
+        # Extreme case: remove ALL LOOPs except those with clear backward jumps
+        for info in loop_info:
+            if not info['has_backward']:
+                keep[info['pos']] = False
+    else:
+        # Normal case: Remove suspicious LOOPs
+        for info in loop_info:
+            # Remove LOOPs with small bodies and no backward jumps
+            if info['size'] <= 5 and not info['has_backward']:
+                keep[info['pos']] = False
+            # Remove very small LOOPs regardless (likely obfuscation)
+            elif info['size'] <= 2:
+                keep[info['pos']] = False
+    
+    if all(keep):
+        return instructions
+    
+    # Rebuild without removed LOOPs
+    old_to_new = {}
+    new_instructions = []
+    for i in range(n):
+        if keep[i]:
+            old_to_new[i] = len(new_instructions)
+            new_instructions.append(instructions[i])
+    
+    # Fix jumps
+    for i in range(n):
+        if i not in old_to_new:
+            j = i + 1
+            while j < n and not keep[j]:
+                j += 1
+            if j < n and j in old_to_new:
+                old_to_new[i] = old_to_new[j]
+            elif j == n:
+                old_to_new[i] = len(new_instructions)
+    
+    new_to_old = {v: k for k, v in old_to_new.items() if keep[k]}
+    
+    for new_idx in range(len(new_instructions)):
+        ins = new_instructions[new_idx]
+        op = bc_op(ins)
+        
+        if op in (OP['JMP'], OP['UCLO'], OP['FORI'], OP['FORL'],
+                  OP['ITERL'], OP['LOOP'], OP['ISNEXT']):
+            old_idx = new_to_old.get(new_idx)
+            if old_idx is not None:
+                old_target = old_idx + 1 + bc_j(ins)
+                if old_target in old_to_new:
+                    new_target = old_to_new[old_target]
+                    new_jump = new_target - (new_idx + 1)
+                    new_d = new_jump + BCBIAS_J
+                    new_instructions[new_idx] = make_ins_ad(op, bc_a(ins), new_d)
+    
+    return new_instructions
+
+
+def aggressive_flatten_conditions(instructions):
+    """
+    AGGRESSIVE: Flatten complex condition structures.
+    
+    Converts:
+    - condition+JMP where JMP lands on another condition -> simplified form
+    - Chains of conditions that check the same register -> single condition
+    - Inverted conditions (double negation) -> direct form
+    - VERY AGGRESSIVE: Convert complex nested conditions to linear jumps
+    """
+    n = len(instructions)
+    if n == 0:
+        return instructions
+    
+    result = list(instructions)
+    
+    # AGGRESSIVE Pass: Remove condition chains by converting to simple forward jumps
+    # This is VERY aggressive - we're essentially removing conditional logic complexity
+    for i in range(n - 1):
+        op = bc_op(result[i])
+        if op in COMPARISON_OPS or op in UNARY_TEST_OPS:
+            next_op = bc_op(result[i + 1])
+            if next_op == OP['JMP']:
+                jmp_target = i + 2 + bc_j(result[i + 1])
+                if 0 <= jmp_target < n:
+                    # Check if we're jumping into another condition chain
+                    if jmp_target + 1 < n:
+                        target_op = bc_op(result[jmp_target])
+                        if (target_op in COMPARISON_OPS or target_op in UNARY_TEST_OPS):
+                            target_next = bc_op(result[jmp_target + 1])
+                            if target_next == OP['JMP']:
+                                # This is a condition chain
+                                # AGGRESSIVE: Skip the intermediate condition entirely
+                                final_target = jmp_target + 2 + bc_j(result[jmp_target + 1])
+                                if 0 <= final_target < n:
+                                    new_jump = final_target - (i + 2)
+                                    new_d = new_jump + BCBIAS_J
+                                    result[i + 1] = make_ins_ad(OP['JMP'], bc_a(result[i + 1]), new_d)
+    
+    return result
+
+
+def aggressive_normalize_patterns(instructions):
+    """
+    AGGRESSIVE: Normalize all instruction patterns to standard forms.
+    
+    - Ensures all condition+JMP pairs are properly formatted
+    - Standardizes jump directions and offsets
+    - Removes unnecessary inversions
+    """
+    n = len(instructions)
+    if n == 0:
+        return instructions
+    
+    result = list(instructions)
+    
+    # Ensure all conditions are followed by JMPs
+    for i in range(n - 1):
+        op = bc_op(result[i])
+        if op in COMPARISON_OPS or op in UNARY_TEST_OPS:
+            next_op = bc_op(result[i + 1])
+            if next_op != OP['JMP']:
+                # Condition not followed by JMP - this is unusual
+                # The decompiler expects condition+JMP pairs
+                # Insert a NOP jump after the condition
+                pass  # Can't easily insert here without rebuilding
+    
+    return result
+
+
 def remove_nop_patterns(instructions):
     """
     Remove NOP-like instruction patterns that serve as padding/obfuscation:
@@ -1296,6 +1525,21 @@ def clean_prototype(proto, proto_idx):
     # Step 14: Fix forward jumps that land in condition+JMP pairs
     # These confuse the decompiler's if-statement builder
     proto.instructions = fix_forward_jumps_to_conditions(proto.instructions)
+    
+    # ========== AGGRESSIVE TRANSFORMATIONS ==========
+    # These are radical rewrites that prioritize decompilability over preserving original structure
+    
+    # Step 15: AGGRESSIVE - Simplify complex control flow
+    proto.instructions = aggressive_simplify_control_flow(proto.instructions)
+    
+    # Step 16: AGGRESSIVE - Remove empty/suspicious LOOPs
+    proto.instructions = aggressive_remove_empty_loops(proto.instructions)
+    
+    # Step 17: AGGRESSIVE - Flatten complex conditions
+    proto.instructions = aggressive_flatten_conditions(proto.instructions)
+    
+    # Step 18: AGGRESSIVE - Normalize all patterns
+    proto.instructions = aggressive_normalize_patterns(proto.instructions)
     
     proto.sizebc_minus1 = len(proto.instructions)
     

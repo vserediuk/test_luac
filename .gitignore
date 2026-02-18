@@ -1,2 +1,12 @@
 __pycache__/
 test_output.luac
+*_aggressive.luac
+*_v2.luac
+*_v3.luac
+*_ultra_aggressive.luac
+decompiled_*/
+test_decompile/
+analyze_loops.py
+*.luac
+decompiled_*/
+test_decompile/
