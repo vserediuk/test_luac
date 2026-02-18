@@ -1706,6 +1706,7 @@ def clean_prototype(proto, proto_idx):
     # for the actual register usage. Recalculate it to ensure correctness.
     needed_framesize = recalculate_framesize(proto.instructions, proto.numparams)
     if needed_framesize > proto.framesize:
+        print(f"    Proto #{proto_idx}: framesize {proto.framesize} -> {needed_framesize} (fixed)")
         proto.framesize = needed_framesize
     
     proto.sizebc_minus1 = len(proto.instructions)
