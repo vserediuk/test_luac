@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """
-Test script to verify the fixes for the decompiler crash.
+Test script to verify the fixes for the "Failed to build if statement" decompiler crash.
+
+This test suite validates the fixes for luajit-decompiler-v2 assertion failures that occur
+when the decompiler encounters:
+1. Unsupported JIT-internal opcodes (TGETR, TSETR, ISTYPE, ISNUM)
+2. Orphaned CONDITION statements from backward jumps converted to JMP+0
+3. Invalid LOOP structures that break the decompiler's control flow analysis
+
+Test coverage:
+- JIT opcode remapping (TGETR→TGETV, TSETR→TSETV, ISTYPE→IST, ISNUM→IST, etc.)
+- Backward jump fixing with MOV NOP pattern to avoid orphaned conditions
+- Conservative loop validation to prevent invalid LOOP insertion
 """
 
 import sys
@@ -56,7 +67,7 @@ def test_backward_jump_fixing():
     # ... instructions ...
     # LOOP [5] -> target 9  (inner loop)
     # ... instructions ...
-    # ISLT [6], JMP [7] -> target 0 (crosses outer loop boundary)
+    # ISLT [6], JMP [7] -> backward to position 0 (crosses outer loop boundary)
     
     instructions = [
         make_ins_ad(OP['LOOP'], 0, BCBIAS_J + 9),     # 0: LOOP -> 10
