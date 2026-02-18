@@ -399,7 +399,227 @@ def simplify_test_copy_ops(instructions):
     return result
 
 
-def fix_empty_infinite_loops(instructions):
+def insert_missing_loops(instructions):
+    """
+    Insert LOOP instructions at backward jump targets from conditions
+    where no LOOP instruction exists.
+
+    In LuaJIT, repeat...until and while loops should have a LOOP instruction
+    at the beginning of the loop body. Obfuscation can remove these.
+    The decompiler needs them to properly build loop/if structures.
+
+    Returns new instruction list with LOOPs inserted and jumps fixed.
+    """
+    n = len(instructions)
+
+    # Find existing LOOP positions and their end targets
+    loop_positions = set()
+    loop_ends = {}  # loop_pos -> end_pos
+    for i in range(n):
+        op = bc_op(instructions[i])
+        if op == OP['LOOP']:
+            loop_positions.add(i)
+            loop_ends[i] = i + 1 + bc_j(instructions[i])
+
+    # Find backward jump targets from conditions that lack a LOOP
+    # Also track the farthest backward jump source for each target
+    backward_targets = {}  # target_pos -> max_source_pos
+    for i in range(n):
+        op = bc_op(instructions[i])
+        if op in COMPARISON_OPS or op in UNARY_TEST_OPS:
+            if i + 1 < n and bc_op(instructions[i + 1]) == OP['JMP']:
+                jmp_target = i + 2 + bc_j(instructions[i + 1])
+                if jmp_target < i and jmp_target not in loop_positions:
+                    if jmp_target not in backward_targets or i + 1 > backward_targets[jmp_target]:
+                        backward_targets[jmp_target] = i + 1
+        elif op == OP['JMP']:
+            jmp_target = i + 1 + bc_j(instructions[i])
+            if jmp_target < i and jmp_target not in loop_positions:
+                if jmp_target not in backward_targets or i > backward_targets[jmp_target]:
+                    backward_targets[jmp_target] = i
+
+    if not backward_targets:
+        return instructions
+
+    # Filter: skip targets that are right before an existing LOOP
+    # (these are while-loop condition checks before LOOP)
+    filtered_targets = {}
+    for target_pos, max_source in sorted(backward_targets.items()):
+        # Check if there's an existing LOOP within a few instructions after target
+        has_nearby_loop = False
+        for offset in range(1, 10):
+            check_pos = target_pos + offset
+            if check_pos in loop_positions:
+                has_nearby_loop = True
+                break
+            # Stop if we encounter something that's not a condition/JMP pattern
+            if check_pos >= n:
+                break
+            check_op = bc_op(instructions[check_pos])
+            if check_op not in COMPARISON_OPS and check_op not in UNARY_TEST_OPS and check_op != OP['JMP'] and check_op != OP['LOOP'] and check_op != OP['KSHORT'] and check_op != OP['MODVN'] and check_op != OP['ADDVN']:
+                break
+
+        if not has_nearby_loop:
+            filtered_targets[target_pos] = max_source
+
+    if not filtered_targets:
+        return instructions
+
+    # For each missing LOOP, determine the loop end position
+    loop_inserts = {}
+    for target_pos, max_source in sorted(filtered_targets.items()):
+        loop_end = max_source + 1
+        loop_inserts[target_pos] = loop_end
+
+    # Sort insert positions
+    insert_positions = sorted(loop_inserts.keys())
+
+    # Build new instruction list with LOOPs inserted
+    # Track old_to_new mapping for fixing jumps
+    new_instructions = []
+    old_to_new = {}
+    # Also track which new positions correspond to original instructions
+    new_to_old = {}
+    inserted_count = 0
+
+    for i in range(n):
+        # Insert any LOOPs that go at this position
+        while inserted_count < len(insert_positions) and insert_positions[inserted_count] == i:
+            pos = insert_positions[inserted_count]
+            loop_end = loop_inserts[pos]
+            # Map old position to the LOOP instruction (for backward jumps)
+            old_to_new[i] = len(new_instructions)
+            new_instructions.append(('LOOP_PLACEHOLDER', pos, loop_end))
+            inserted_count += 1
+
+        if i not in old_to_new:
+            old_to_new[i] = len(new_instructions)
+        new_to_old[len(new_instructions)] = i
+        new_instructions.append(instructions[i])
+
+    # Handle any remaining inserts at the end
+    while inserted_count < len(insert_positions):
+        pos = insert_positions[inserted_count]
+        loop_end = loop_inserts[pos]
+        new_instructions.append(('LOOP_PLACEHOLDER', pos, loop_end))
+        inserted_count += 1
+
+    # Also map position n (past end)
+    old_to_new[n] = len(new_instructions)
+
+    # Now fix all jump offsets and resolve LOOP placeholders
+    result = []
+    for ni, item in enumerate(new_instructions):
+        if isinstance(item, tuple) and item[0] == 'LOOP_PLACEHOLDER':
+            _, old_target, old_loop_end = item
+            # LOOP's target should be the new position of old_loop_end
+            new_target = old_to_new.get(old_loop_end, len(new_instructions))
+            new_jump = new_target - (ni + 1)
+            new_d = new_jump + BCBIAS_J
+            result.append(make_ins_ad(OP['LOOP'], 0, new_d))
+        else:
+            ins = item
+            op = bc_op(ins)
+            needs_jump_fix = op in (OP['JMP'], OP['UCLO'], OP['FORI'], OP['FORL'],
+                                    OP['ITERL'], OP['LOOP'], OP['ISNEXT'])
+            if needs_jump_fix:
+                old_pos = new_to_old.get(ni)
+                if old_pos is not None:
+                    old_target = old_pos + 1 + bc_j(ins)
+                    new_target = old_to_new.get(old_target, len(new_instructions))
+                    new_jump = new_target - (ni + 1)
+                    new_d = new_jump + BCBIAS_J
+                    result.append(make_ins_ad(op, bc_a(ins), new_d))
+                else:
+                    result.append(ins)
+            else:
+                result.append(ins)
+
+    return result
+
+
+def fix_cross_loop_backward_jumps(instructions):
+    """
+    Fix backward-jumping conditions that cross LOOP boundaries.
+
+    When a condition inside a LOOP body jumps backward to a position
+    before the LOOP, the decompiler can't handle it (no goto in Lua 5.1).
+    Convert these to forward jumps to the enclosing LOOP's end (break).
+
+    Also fix standalone backward JMPs that cross LOOP boundaries by
+    redirecting them to the enclosing LOOP's end.
+    """
+    n = len(instructions)
+
+    # Build LOOP ranges: (start, end)
+    loop_ranges = []
+    for i in range(n):
+        op = bc_op(instructions[i])
+        if op == OP['LOOP']:
+            end = i + 1 + bc_j(instructions[i])
+            loop_ranges.append((i, end))
+
+    if not loop_ranges:
+        return instructions
+
+    # Sort by start position
+    loop_ranges.sort()
+
+    result = list(instructions)
+    changed = False
+
+    for i in range(n):
+        op = bc_op(instructions[i])
+
+        # Handle condition + JMP backward
+        if op in COMPARISON_OPS or op in UNARY_TEST_OPS:
+            if i + 1 < n and bc_op(instructions[i + 1]) == OP['JMP']:
+                jmp_pos = i + 1
+                jmp_target = jmp_pos + 1 + bc_j(instructions[jmp_pos])
+                if jmp_target < i:
+                    # Find enclosing LOOP
+                    enclosing_end = None
+                    for ls, le in loop_ranges:
+                        if ls < i and le > i:
+                            if jmp_target <= ls:
+                                # Backward jump crosses this LOOP boundary
+                                enclosing_end = le
+                                break
+
+                    if enclosing_end is not None:
+                        # Redirect to LOOP end (break equivalent)
+                        new_jump = enclosing_end - (jmp_pos + 1)
+                        new_d = new_jump + BCBIAS_J
+                        result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
+                        # Invert the condition (since we're changing from "if cond goto back"
+                        # to "if !cond goto forward")
+                        # Actually we want: original = "if cond, skip JMP; JMP backward"
+                        # Now: "if cond, skip JMP; JMP forward (break)"
+                        # The semantics: originally if cond is TRUE, skip the backward JMP
+                        # and continue. If FALSE, jump backward.
+                        # New: if cond is TRUE, skip the forward JMP and continue.
+                        # If FALSE, jump forward (break).
+                        # Same logic - no need to invert!
+                        changed = True
+
+        # Handle standalone backward JMP that crosses LOOP boundary
+        elif op == OP['JMP']:
+            jmp_target = i + 1 + bc_j(instructions[i])
+            if jmp_target < i:
+                enclosing_end = None
+                for ls, le in loop_ranges:
+                    if ls < i and le > i:
+                        if jmp_target <= ls:
+                            enclosing_end = le
+                            break
+
+                if enclosing_end is not None:
+                    new_jump = enclosing_end - (i + 1)
+                    new_d = new_jump + BCBIAS_J
+                    result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
+                    changed = True
+
+    return result
     """
     Fix empty infinite loop patterns: LOOP + JMP backward with no useful body.
     These are obfuscation artifacts that crash decompilers.
@@ -910,6 +1130,13 @@ def clean_prototype(proto, proto_idx):
     
     # Step 10: Simplify ISTC/ISFC to IST/ISF
     proto.instructions = simplify_test_copy_ops(proto.instructions)
+    
+    # Step 11: Insert missing LOOP instructions for backward jumps
+    proto.instructions = insert_missing_loops(proto.instructions)
+    
+    # Step 12: Fix backward-jumping conditions inside LOOPs
+    # Convert them to forward jumps to the enclosing LOOP's end
+    proto.instructions = fix_cross_loop_backward_jumps(proto.instructions)
     
     proto.sizebc_minus1 = len(proto.instructions)
     
