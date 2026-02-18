@@ -1467,6 +1467,166 @@ def fix_fori_forl_pairs(instructions):
     return instructions
 
 
+def recalculate_framesize(instructions, numparams):
+    """
+    Recalculate the minimum framesize needed for the given instructions.
+
+    The obfuscator may have set an incorrect framesize that is too small
+    for the actual register usage. This causes LuaJIT to crash or produce
+    nil values at runtime because registers beyond the framesize are not
+    properly allocated.
+
+    Returns the minimum framesize needed (number of stack slots).
+    """
+    max_slot = numparams  # At minimum, need slots for parameters
+
+    for ins in instructions:
+        op = bc_op(ins)
+        a = bc_a(ins)
+        d = bc_d(ins)
+
+        # Upvalue set ops: A is upvalue index, not register
+        if op in (OP['USETV'], OP['USETS'], OP['USETN'], OP['USETP']):
+            if op == OP['USETV']:
+                max_slot = max(max_slot, d + 1)  # D is the source register
+            continue
+
+        # CALL/CALLM: need slots for function + args + results
+        if op in (OP['CALL'], OP['CALLM']):
+            b = (d >> 8) & 0xff   # nresults+1 (0=MULTRES)
+            c = d & 0xff          # nargs+1
+            max_slot = max(max_slot, a + max(b, c))
+            continue
+
+        # CALLT/CALLMT: tailcall, need slots for function + args
+        if op in (OP['CALLT'], OP['CALLMT']):
+            max_slot = max(max_slot, a + d)
+            continue
+
+        # VARG: stores varargs starting at A
+        if op == OP['VARG']:
+            max_slot = max(max_slot, a + 1)
+            continue
+
+        # For loop init/back: uses A, A+1, A+2, A+3
+        if op in (OP['FORI'], OP['JFORI'], OP['FORL'], OP['IFORL'], OP['JFORL']):
+            max_slot = max(max_slot, a + 4)
+            continue
+
+        # Iterator call: uses A, A+1, A+2
+        if op in (OP['ITERC'], OP['ITERN']):
+            max_slot = max(max_slot, a + 3)
+            continue
+
+        # KNIL: sets registers A through D to nil
+        if op == OP['KNIL']:
+            max_slot = max(max_slot, d + 1)
+            continue
+
+        # MOV/NOT/UNM/LEN: A=dest, D=src (both registers)
+        if op in (OP['MOV'], OP['NOT'], OP['UNM'], OP['LEN']):
+            max_slot = max(max_slot, max(a, d) + 1)
+            continue
+
+        # ISTC/ISFC: A=dest, D=test (both registers)
+        if op in (OP['ISTC'], OP['ISFC']):
+            max_slot = max(max_slot, max(a, d) + 1)
+            continue
+
+        # IST/ISF: D=test register
+        if op in (OP['IST'], OP['ISF']):
+            max_slot = max(max_slot, d + 1)
+            continue
+
+        # CAT: A=dest, B=start_reg, C=end_reg
+        if op == OP['CAT']:
+            b = (d >> 8) & 0xff
+            c = d & 0xff
+            max_slot = max(max_slot, max(a, max(b, c)) + 1)
+            continue
+
+        # Binary ops VN/NV: A=dest, B=register, C=constant
+        if op in (OP['ADDVN'], OP['SUBVN'], OP['MULVN'], OP['DIVVN'], OP['MODVN'],
+                  OP['ADDNV'], OP['SUBNV'], OP['MULNV'], OP['DIVNV'], OP['MODNV']):
+            b = (d >> 8) & 0xff
+            max_slot = max(max_slot, max(a, b) + 1)
+            continue
+
+        # Binary ops VV: A=dest, B=reg, C=reg
+        if op in (OP['ADDVV'], OP['SUBVV'], OP['MULVV'], OP['DIVVV'], OP['MODVV'], OP['POW']):
+            b = (d >> 8) & 0xff
+            c = d & 0xff
+            max_slot = max(max_slot, max(a, max(b, c)) + 1)
+            continue
+
+        # Table ops: TGETV/TSETV use A, B, C as registers
+        if op in (OP['TGETV'], OP['TSETV']):
+            b = (d >> 8) & 0xff
+            c = d & 0xff
+            max_slot = max(max_slot, max(a, max(b, c)) + 1)
+            continue
+
+        # TGETS/TSETS: A=val, B=table (register), C=string index
+        if op in (OP['TGETS'], OP['TSETS']):
+            b = (d >> 8) & 0xff
+            max_slot = max(max_slot, max(a, b) + 1)
+            continue
+
+        # TGETB/TSETB: A=val, B=table (register), C=byte index
+        if op in (OP['TGETB'], OP['TSETB']):
+            b = (d >> 8) & 0xff
+            max_slot = max(max_slot, max(a, b) + 1)
+            continue
+
+        # TGETR/TSETR: A=val, B=table, C=key (all registers)
+        if op in (OP['TGETR'], OP['TSETR']):
+            b = (d >> 8) & 0xff
+            c = d & 0xff
+            max_slot = max(max_slot, max(a, max(b, c)) + 1)
+            continue
+
+        # Comparison ops: two registers
+        if op in (OP['ISLT'], OP['ISGE'], OP['ISLE'], OP['ISGT'],
+                  OP['ISEQV'], OP['ISNEV']):
+            max_slot = max(max_slot, max(a, d) + 1)
+            continue
+
+        # Comparison ops: register + constant/primitive
+        if op in (OP['ISEQS'], OP['ISNES'], OP['ISEQN'], OP['ISNEN'],
+                  OP['ISEQP'], OP['ISNEP']):
+            max_slot = max(max_slot, a + 1)
+            continue
+
+        # RET: return values from A
+        if op == OP['RET']:
+            if d >= 2:
+                max_slot = max(max_slot, a + d - 1)
+            else:
+                max_slot = max(max_slot, a + 1)
+            continue
+        if op == OP['RET1']:
+            max_slot = max(max_slot, a + 1)
+            continue
+        if op == OP['RETM']:
+            max_slot = max(max_slot, a + d + 1)
+            continue
+
+        # Control flow ops: no register impact
+        if op in (OP['JMP'], OP['LOOP'], OP['ILOOP'], OP['JLOOP'],
+                  OP['RET0'], OP['ISNEXT'], OP['UCLO']):
+            continue
+
+        # ISTYPE/ISNUM: A is register
+        if op in (OP['ISTYPE'], OP['ISNUM']):
+            max_slot = max(max_slot, a + 1)
+            continue
+
+        # Default: treat A as register
+        max_slot = max(max_slot, a + 1)
+
+    return max_slot
+
+
 def clean_prototype(proto, proto_idx):
     """Clean a single prototype by removing dead code."""
     instructions = list(proto.instructions)
@@ -1540,6 +1700,13 @@ def clean_prototype(proto, proto_idx):
     
     # Step 18: AGGRESSIVE - Normalize all patterns
     proto.instructions = aggressive_normalize_patterns(proto.instructions)
+    
+    # Step 19: Recalculate framesize
+    # The obfuscator may have set an incorrect framesize that is too small
+    # for the actual register usage. Recalculate it to ensure correctness.
+    needed_framesize = recalculate_framesize(proto.instructions, proto.numparams)
+    if needed_framesize > proto.framesize:
+        proto.framesize = needed_framesize
     
     proto.sizebc_minus1 = len(proto.instructions)
     
