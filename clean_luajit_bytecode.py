@@ -735,21 +735,7 @@ def validate_and_cleanup_control_flow(instructions):
                 end = n
             loop_ranges.append((i, end))
     
-    # Check for overlapping (improperly nested) LOOPs
-    # This is a validation check - proper nesting means one LOOP is completely inside another
-    # If we find improper overlapping, the bytecode may have issues, but we log and continue
-    for i, (ls1, le1) in enumerate(loop_ranges):
-        for ls2, le2 in loop_ranges[i+1:]:
-            if ls1 < ls2 < le1 < le2:
-                # Improper overlap detected - ls2 starts inside loop1 but ends outside
-                # This indicates malformed control flow but we can't easily fix it here
-                pass
-            elif ls2 < ls1 < le2 < le1:
-                # Improper overlap detected - ls1 starts inside loop2 but ends outside
-                pass
-    
     result = list(instructions)
-    changed = False
     
     # Find and fix problematic backward jumps
     for i in range(n):
@@ -767,7 +753,6 @@ def validate_and_cleanup_control_flow(instructions):
                     # Convert to a NOP (jump to next instruction)
                     new_d = 0 + BCBIAS_J
                     result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
-                    changed = True
                 else:
                     ls, le = enclosing
                     if jmp_target < ls:
@@ -777,7 +762,6 @@ def validate_and_cleanup_control_flow(instructions):
                         new_jump = le - (i + 1)
                         new_d = new_jump + BCBIAS_J
                         result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
-                        changed = True
                     # else: backward jump within same LOOP - this is OK (repeat...until)
         
         elif op in COMPARISON_OPS or op in UNARY_TEST_OPS:
@@ -794,7 +778,6 @@ def validate_and_cleanup_control_flow(instructions):
                         # Convert to forward jump (NOP equivalent)
                         new_d = 0 + BCBIAS_J
                         result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
-                        changed = True
                     else:
                         ls, le = enclosing
                         if jmp_target < ls:
@@ -803,7 +786,6 @@ def validate_and_cleanup_control_flow(instructions):
                             new_jump = le - (jmp_pos + 1)
                             new_d = new_jump + BCBIAS_J
                             result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
-                            changed = True
     
     return result
 
