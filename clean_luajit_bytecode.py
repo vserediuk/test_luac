@@ -103,6 +103,13 @@ JIT_REMAP = {
     OP['JFUNCF']: OP['FUNCF'],
     OP['IFUNCV']: OP['FUNCV'],
     OP['JFUNCV']: OP['FUNCV'],
+    # TGETR/TSETR are JIT-internal table access opcodes
+    OP['TGETR']: OP['TGETV'],
+    OP['TSETR']: OP['TSETV'],
+    # ISTYPE/ISNUM are JIT-internal type check opcodes
+    # Convert to IST (test if truthy) as a safe fallback
+    OP['ISTYPE']: OP['IST'],
+    OP['ISNUM']: OP['IST'],
 }
 
 # Function header opcodes (should never appear in the middle of code)
