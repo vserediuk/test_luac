@@ -529,6 +529,28 @@ def insert_missing_loops(instructions):
     return result
 
 
+def _find_innermost_enclosing_loop(loop_ranges, pos):
+    """
+    Find the innermost LOOP that contains position pos.
+    
+    Args:
+        loop_ranges: List of (start, end) tuples for LOOP instructions
+        pos: Position to check
+        
+    Returns:
+        (start, end) tuple for the innermost LOOP, or None if not in any LOOP
+    """
+    innermost = None
+    innermost_size = float('inf')
+    for ls, le in loop_ranges:
+        if ls < pos < le:
+            size = le - ls
+            if size < innermost_size:
+                innermost = (ls, le)
+                innermost_size = size
+    return innermost
+
+
 def fix_cross_loop_backward_jumps(instructions):
     """
     Fix backward-jumping conditions that cross LOOP boundaries.
@@ -564,18 +586,6 @@ def fix_cross_loop_backward_jumps(instructions):
 
     result = list(instructions)
     changed = False
-    
-    def find_innermost_enclosing_loop(pos):
-        """Find the innermost LOOP that contains position pos."""
-        innermost = None
-        innermost_size = float('inf')
-        for ls, le in loop_ranges:
-            if ls < pos < le:
-                size = le - ls
-                if size < innermost_size:
-                    innermost = (ls, le)
-                    innermost_size = size
-        return innermost
 
     for i in range(n):
         op = bc_op(instructions[i])
@@ -587,7 +597,7 @@ def fix_cross_loop_backward_jumps(instructions):
                 jmp_target = jmp_pos + 1 + bc_j(instructions[jmp_pos])
                 if jmp_target < i:
                     # Find innermost enclosing LOOP
-                    enclosing = find_innermost_enclosing_loop(i)
+                    enclosing = _find_innermost_enclosing_loop(loop_ranges, i)
                     
                     if enclosing is not None:
                         ls, le = enclosing
@@ -609,7 +619,7 @@ def fix_cross_loop_backward_jumps(instructions):
             jmp_target = i + 1 + bc_j(instructions[i])
             if jmp_target < i:
                 # Find innermost enclosing LOOP
-                enclosing = find_innermost_enclosing_loop(i)
+                enclosing = _find_innermost_enclosing_loop(loop_ranges, i)
                 
                 if enclosing is not None:
                     ls, le = enclosing
@@ -726,28 +736,20 @@ def validate_and_cleanup_control_flow(instructions):
             loop_ranges.append((i, end))
     
     # Check for overlapping (improperly nested) LOOPs
+    # This is a validation check - proper nesting means one LOOP is completely inside another
+    # If we find improper overlapping, the bytecode may have issues, but we log and continue
     for i, (ls1, le1) in enumerate(loop_ranges):
         for ls2, le2 in loop_ranges[i+1:]:
-            # Check if they overlap improperly
-            # Proper nesting: one is completely inside the other
-            # Improper: they partially overlap
             if ls1 < ls2 < le1 < le2:
-                # Improper overlap - ls2 starts inside loop1 but ends outside
-                # This shouldn't happen with proper control flow
+                # Improper overlap detected - ls2 starts inside loop1 but ends outside
+                # This indicates malformed control flow but we can't easily fix it here
                 pass
             elif ls2 < ls1 < le2 < le1:
-                # Improper overlap - ls1 starts inside loop2 but ends outside
+                # Improper overlap detected - ls1 starts inside loop2 but ends outside
                 pass
     
     result = list(instructions)
     changed = False
-    
-    def find_enclosing_loop(pos):
-        """Find any LOOP that contains position pos."""
-        for ls, le in loop_ranges:
-            if ls < pos < le:
-                return (ls, le)
-        return None
     
     # Find and fix problematic backward jumps
     for i in range(n):
@@ -757,7 +759,7 @@ def validate_and_cleanup_control_flow(instructions):
             jmp_target = i + 1 + bc_j(instructions[i])
             if jmp_target < i:
                 # Backward jump
-                enclosing = find_enclosing_loop(i)
+                enclosing = _find_innermost_enclosing_loop(loop_ranges, i)
                 
                 if enclosing is None:
                     # Backward jump with NO enclosing LOOP
@@ -785,7 +787,7 @@ def validate_and_cleanup_control_flow(instructions):
                 jmp_target = jmp_pos + 1 + bc_j(instructions[jmp_pos])
                 if jmp_target < i:
                     # Backward jump from condition
-                    enclosing = find_enclosing_loop(i)
+                    enclosing = _find_innermost_enclosing_loop(loop_ranges, i)
                     
                     if enclosing is None:
                         # Backward jump with NO enclosing LOOP
