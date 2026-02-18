@@ -417,6 +417,7 @@ def validate_loop_range(instructions, start, end):
     # Track backward jumps to start
     backward_jumps_to_start = 0
     last_backward_jump_pos = -1
+    processed_jumps = set()  # Track JMPs already processed as part of condition+JMP pairs
     
     # Check all jumps within the proposed loop range
     for i in range(start, end):
@@ -426,6 +427,7 @@ def validate_loop_range(instructions, start, end):
         if op in COMPARISON_OPS or op in UNARY_TEST_OPS:
             if i + 1 < n and bc_op(instructions[i + 1]) == OP['JMP']:
                 jmp_pos = i + 1
+                processed_jumps.add(jmp_pos)  # Mark this JMP as processed
                 if jmp_pos < end:  # JMP is within the proposed range
                     jmp_target = jmp_pos + 1 + bc_j(instructions[jmp_pos])
                     
@@ -442,8 +444,8 @@ def validate_loop_range(instructions, start, end):
                         backward_jumps_to_start += 1
                         last_backward_jump_pos = jmp_pos
         
-        # Check standalone JMP
-        elif op == OP['JMP']:
+        # Check standalone JMP (skip if already processed as part of condition+JMP)
+        elif op == OP['JMP'] and i not in processed_jumps:
             jmp_target = i + 1 + bc_j(instructions[i])
             
             # CONSERVATIVE: Check all jumps stay within [start, end]
