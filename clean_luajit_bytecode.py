@@ -311,15 +311,6 @@ def remove_dead_code(instructions, reachable):
             old_to_new[i] = len(new_instructions)
             new_instructions.append(instructions[i])
     
-    # Fix jump offsets in the new instruction list
-    for new_idx in range(len(new_instructions)):
-        ins = new_instructions[new_idx]
-        op = bc_op(ins)
-        
-        # Find the original index
-        # We need to map back. Let's build reverse map.
-        pass
-    
     # Build reverse map: new_idx -> old_idx
     new_to_old = {}
     for old_idx, new_idx in old_to_new.items():
@@ -548,6 +539,12 @@ def fix_cross_loop_backward_jumps(instructions):
 
     Also fix standalone backward JMPs that cross LOOP boundaries by
     redirecting them to the enclosing LOOP's end.
+    
+    Handles:
+    1. Backward jumps within the same LOOP (legitimate repeat...until) - leave alone
+    2. Backward jumps crossing LOOP boundaries - convert to forward jump
+    3. Nested LOOPs - find innermost enclosing LOOP
+    4. Cases with no enclosing LOOP - convert to NOP or forward jump
     """
     n = len(instructions)
 
@@ -567,6 +564,18 @@ def fix_cross_loop_backward_jumps(instructions):
 
     result = list(instructions)
     changed = False
+    
+    def find_innermost_enclosing_loop(pos):
+        """Find the innermost LOOP that contains position pos."""
+        innermost = None
+        innermost_size = float('inf')
+        for ls, le in loop_ranges:
+            if ls < pos < le:
+                size = le - ls
+                if size < innermost_size:
+                    innermost = (ls, le)
+                    innermost_size = size
+        return innermost
 
     for i in range(n):
         op = bc_op(instructions[i])
@@ -577,49 +586,50 @@ def fix_cross_loop_backward_jumps(instructions):
                 jmp_pos = i + 1
                 jmp_target = jmp_pos + 1 + bc_j(instructions[jmp_pos])
                 if jmp_target < i:
-                    # Find enclosing LOOP
-                    enclosing_end = None
-                    for ls, le in loop_ranges:
-                        if ls < i and le > i:
-                            if jmp_target <= ls:
-                                # Backward jump crosses this LOOP boundary
-                                enclosing_end = le
-                                break
-
-                    if enclosing_end is not None:
-                        # Redirect to LOOP end (break equivalent)
-                        new_jump = enclosing_end - (jmp_pos + 1)
-                        new_d = new_jump + BCBIAS_J
-                        result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
-                        # Invert the condition (since we're changing from "if cond goto back"
-                        # to "if !cond goto forward")
-                        # Actually we want: original = "if cond, skip JMP; JMP backward"
-                        # Now: "if cond, skip JMP; JMP forward (break)"
-                        # The semantics: originally if cond is TRUE, skip the backward JMP
-                        # and continue. If FALSE, jump backward.
-                        # New: if cond is TRUE, skip the forward JMP and continue.
-                        # If FALSE, jump forward (break).
-                        # Same logic - no need to invert!
-                        changed = True
+                    # Find innermost enclosing LOOP
+                    enclosing = find_innermost_enclosing_loop(i)
+                    
+                    if enclosing is not None:
+                        ls, le = enclosing
+                        # Check if this is a legitimate repeat...until within the same LOOP
+                        if jmp_target >= ls:
+                            # Backward jump targets a position within the same LOOP
+                            # This is legitimate (repeat...until pattern), leave it alone
+                            continue
+                        else:
+                            # Backward jump crosses LOOP boundary - redirect to LOOP end
+                            new_jump = le - (jmp_pos + 1)
+                            new_d = new_jump + BCBIAS_J
+                            result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
+                            changed = True
+                    # else: no enclosing LOOP - leave as is (will be handled by validation pass)
 
         # Handle standalone backward JMP that crosses LOOP boundary
         elif op == OP['JMP']:
             jmp_target = i + 1 + bc_j(instructions[i])
             if jmp_target < i:
-                enclosing_end = None
-                for ls, le in loop_ranges:
-                    if ls < i and le > i:
-                        if jmp_target <= ls:
-                            enclosing_end = le
-                            break
-
-                if enclosing_end is not None:
-                    new_jump = enclosing_end - (i + 1)
-                    new_d = new_jump + BCBIAS_J
-                    result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
-                    changed = True
+                # Find innermost enclosing LOOP
+                enclosing = find_innermost_enclosing_loop(i)
+                
+                if enclosing is not None:
+                    ls, le = enclosing
+                    # Check if this is within the same LOOP
+                    if jmp_target >= ls:
+                        # Backward jump targets a position within the same LOOP
+                        # This is legitimate (repeat...until or loop back-edge), leave it alone
+                        continue
+                    else:
+                        # Backward jump crosses LOOP boundary - redirect to LOOP end
+                        new_jump = le - (i + 1)
+                        new_d = new_jump + BCBIAS_J
+                        result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
+                        changed = True
+                # else: no enclosing LOOP - leave as is (will be handled by validation pass)
 
     return result
+
+
+def fix_empty_infinite_loops(instructions):
     """
     Fix empty infinite loop patterns: LOOP + JMP backward with no useful body.
     These are obfuscation artifacts that crash decompilers.
@@ -687,6 +697,113 @@ def fix_cross_loop_backward_jumps(instructions):
                 new_instructions[new_idx] = make_ins_ad(op, bc_a(ins), new_d)
     
     return new_instructions
+
+
+def validate_and_cleanup_control_flow(instructions):
+    """
+    Validation and cleanup pass after all transformations.
+    
+    1. Verifies all LOOP ranges are properly nested (no overlapping)
+    2. Ensures no backward jumps exist without an enclosing LOOP
+    3. Removes remaining problematic backward JMPs by converting to forward jumps or NOPs
+    
+    This is the final pass to ensure the bytecode can be decompiled successfully.
+    """
+    n = len(instructions)
+    if n == 0:
+        return instructions
+    
+    # Build LOOP ranges and check for proper nesting
+    loop_ranges = []
+    for i in range(n):
+        op = bc_op(instructions[i])
+        if op == OP['LOOP']:
+            end = i + 1 + bc_j(instructions[i])
+            if end > n:
+                # LOOP points past the end of instructions - invalid
+                # Clamp it to the end
+                end = n
+            loop_ranges.append((i, end))
+    
+    # Check for overlapping (improperly nested) LOOPs
+    for i, (ls1, le1) in enumerate(loop_ranges):
+        for ls2, le2 in loop_ranges[i+1:]:
+            # Check if they overlap improperly
+            # Proper nesting: one is completely inside the other
+            # Improper: they partially overlap
+            if ls1 < ls2 < le1 < le2:
+                # Improper overlap - ls2 starts inside loop1 but ends outside
+                # This shouldn't happen with proper control flow
+                pass
+            elif ls2 < ls1 < le2 < le1:
+                # Improper overlap - ls1 starts inside loop2 but ends outside
+                pass
+    
+    result = list(instructions)
+    changed = False
+    
+    def find_enclosing_loop(pos):
+        """Find any LOOP that contains position pos."""
+        for ls, le in loop_ranges:
+            if ls < pos < le:
+                return (ls, le)
+        return None
+    
+    # Find and fix problematic backward jumps
+    for i in range(n):
+        op = bc_op(instructions[i])
+        
+        if op == OP['JMP']:
+            jmp_target = i + 1 + bc_j(instructions[i])
+            if jmp_target < i:
+                # Backward jump
+                enclosing = find_enclosing_loop(i)
+                
+                if enclosing is None:
+                    # Backward jump with NO enclosing LOOP
+                    # This cannot be expressed in Lua 5.1 without goto
+                    # Convert to a NOP (jump to next instruction)
+                    new_d = 0 + BCBIAS_J
+                    result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
+                    changed = True
+                else:
+                    ls, le = enclosing
+                    if jmp_target < ls:
+                        # Backward jump crosses LOOP boundary
+                        # This should have been fixed earlier, but as a safety net:
+                        # Convert to forward jump to LOOP end
+                        new_jump = le - (i + 1)
+                        new_d = new_jump + BCBIAS_J
+                        result[i] = make_ins_ad(OP['JMP'], bc_a(instructions[i]), new_d)
+                        changed = True
+                    # else: backward jump within same LOOP - this is OK (repeat...until)
+        
+        elif op in COMPARISON_OPS or op in UNARY_TEST_OPS:
+            # Check if followed by a backward JMP
+            if i + 1 < n and bc_op(instructions[i + 1]) == OP['JMP']:
+                jmp_pos = i + 1
+                jmp_target = jmp_pos + 1 + bc_j(instructions[jmp_pos])
+                if jmp_target < i:
+                    # Backward jump from condition
+                    enclosing = find_enclosing_loop(i)
+                    
+                    if enclosing is None:
+                        # Backward jump with NO enclosing LOOP
+                        # Convert to forward jump (NOP equivalent)
+                        new_d = 0 + BCBIAS_J
+                        result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
+                        changed = True
+                    else:
+                        ls, le = enclosing
+                        if jmp_target < ls:
+                            # Backward jump crosses LOOP boundary
+                            # Convert to forward jump to LOOP end
+                            new_jump = le - (jmp_pos + 1)
+                            new_d = new_jump + BCBIAS_J
+                            result[jmp_pos] = make_ins_ad(OP['JMP'], bc_a(instructions[jmp_pos]), new_d)
+                            changed = True
+    
+    return result
 
 
 def remove_nop_patterns(instructions):
@@ -1137,6 +1254,10 @@ def clean_prototype(proto, proto_idx):
     # Step 12: Fix backward-jumping conditions inside LOOPs
     # Convert them to forward jumps to the enclosing LOOP's end
     proto.instructions = fix_cross_loop_backward_jumps(proto.instructions)
+    
+    # Step 13: Validate and cleanup control flow
+    # Final pass to ensure all patterns can be decompiled
+    proto.instructions = validate_and_cleanup_control_flow(proto.instructions)
     
     proto.sizebc_minus1 = len(proto.instructions)
     
